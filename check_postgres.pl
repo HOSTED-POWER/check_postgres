@@ -47,7 +47,7 @@ our %ROLLBACK_ACTIVITY_KEYS = (
     minxact  => 'minxact',
     minrb    => 'minrb',
 );
-our $DISPLAY_VERSION = "$VERSION-hp1";
+our $DISPLAY_VERSION = "$VERSION-hp2";
 our $COMMA = ',';
 
 use vars qw/ %opt $PGBINDIR $PSQL $res $COM $SQL $db /;

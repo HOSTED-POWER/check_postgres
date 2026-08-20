@@ -1,0 +1,15 @@
+#!/usr/bin/env perl
+
+## BSD licensed; see the LICENSE file in the check_postgres distribution.
+
+use 5.10.0;
+use strict;
+use warnings;
+use File::Basename qw/basename/;
+use FindBin qw/$RealBin/;
+
+my $program = "$RealBin/check_postgres.pl";
+$ENV{CHECK_POSTGRES_PROGRAM_NAME} = basename($0);
+exec $^X, $program, @ARGV;
+
+die qq{Could not run "$program": $!\n};

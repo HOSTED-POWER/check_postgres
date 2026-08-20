@@ -62,7 +62,7 @@ my %opts = (
     },
     NO_META        => 1,
     VERSION_FROM   => 'check_postgres.pl',
-    EXE_FILES      => ['check_postgres.pl'],
+    EXE_FILES      => ['check_postgres.pl', 'check_postgresql'],
     MAN1PODS       => { 'check_postgres.pl' => 'blib/man1/check_postgres.1p'},
     NEEDS_LINKING  => 0,
     NORECURS       => 1,

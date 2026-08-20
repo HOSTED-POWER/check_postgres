@@ -1,4 +1,5 @@
 check_postgres.pl
+check_postgresql
 check_postgres.pl.asc
 check_postgres.pl.html
 LICENSE
@@ -14,6 +15,7 @@ MYMETA.yml
 TODO
 
 t/00_basic.t
+t/00_check_postgresql.t
 t/00_release.t
 t/00_signature.t
 t/00_test_tester.t
@@ -51,6 +53,7 @@ t/02_query_time.t
 t/02_relation_size.t
 t/02_replicate_row.t
 t/02_replication_slots.t
+t/02_rollback_activity.t
 t/02_same_schema.t
 t/02_sequence.t
 t/02_settings_checksum.t

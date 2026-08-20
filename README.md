@@ -5,6 +5,28 @@ check_postgres
 
 This is check_postgres, a monitoring tool for Postgres.
 
+HOSTED-POWER fork
+-----------------
+
+This fork also installs `check_postgresql`, while retaining the upstream
+`check_postgres.pl` executable for compatibility. Its `rollback_activity` action checks
+recent transaction-counter deltas with ratio and volume gates, stores its baseline in a
+local state file, and emits standard Nagios performance data without requiring Graphite.
+The initial fork revision reports itself as `2.26.0-hp1`. The conservative fleet policy
+below treats the action as a rollback-storm safety signal:
+
+    check_postgresql --action=rollback_activity \
+      --warning=50% --critical=75% \
+      --min-xact-rate=1 --min-rollback-rate=1 \
+      --state-file=/var/lib/icinga2/check_postgresql/rollback_activity.state
+
+The first execution records the baseline and returns OK. Create the state directory in
+advance, make it writable by the monitoring user, and use a unique absolute state-file
+path for each separately scheduled service check. See `check_postgresql --man` for full
+details. PostgreSQL's transaction counters do not identify why a transaction rolled
+back, so this action detects major recent rollback activity rather than individual
+PostgreSQL or application errors.
+
 The most complete and up to date information about this script can be found at:
 
 https://bucardo.org/check_postgres/

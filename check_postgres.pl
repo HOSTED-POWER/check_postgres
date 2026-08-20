@@ -22,10 +22,11 @@ use warnings;
 use utf8;
 use Getopt::Long qw/GetOptions/;
 Getopt::Long::Configure(qw/ no_ignore_case pass_through  /);
-use File::Basename qw/basename/;
+use File::Basename qw/basename dirname/;
 use File::Spec::Functions;
 use File::Temp qw/tempfile tempdir/;
 File::Temp->safe_level( File::Temp::MEDIUM );
+use Fcntl qw/:flock/;
 use Cwd;
 use Data::Dumper qw/Dumper/;
 $Data::Dumper::Varname = 'POSTGRES';
@@ -35,6 +36,7 @@ $Data::Dumper::Useqq = 1;
 binmode STDOUT, ':encoding(UTF-8)';
 
 our $VERSION = '2.26.0';
+our $DISPLAY_VERSION = "$VERSION-hp1";
 our $COMMA = ',';
 
 use vars qw/ %opt $PGBINDIR $PSQL $res $COM $SQL $db /;
@@ -1267,8 +1269,8 @@ $lang = substr($lang,0,2);
 ## Messages are stored in these until the final output via finishup()
 our (%ok, %warning, %critical, %unknown);
 
-our $ME = basename($0);
-our $ME2 = 'check_postgres.pl';
+our $ME = delete $ENV{CHECK_POSTGRES_PROGRAM_NAME} || basename($0);
+our $ME2 = $ME eq 'check_postgresql' ? $ME : 'check_postgres.pl';
 our $USAGE = msg('usage', $ME);
 
 ## This gets turned on for meta-commands which don't hit a Postgres database
@@ -1712,6 +1714,9 @@ GetOptions(
     'PSQL=s',
 
     'tempdir=s',
+    'state-file=s', ## used by rollback_activity only
+    'min-xact-rate=f', ## used by rollback_activity only
+    'min-rollback-rate=f', ## used by rollback_activity only
     'audit-file-dir=s',
     'get_method=s',
     'language=s',
@@ -1861,14 +1866,14 @@ our $SIMPLE = $OUTPUT eq 'simple' ? 1 : 0;
 
 ## See if we need to invoke something based on our name
 our $action = $opt{action} || '';
-if ($ME =~ /check_postgres_(\w+)/ and ! defined $opt{action}) {
+if ($ME =~ /check_postgres(?:ql)?_(\w+)/ and ! defined $opt{action}) {
     $action = $1;
 }
 
 $VERBOSE >= 3 and warn Dumper \%opt;
 
 if ($opt{version}) {
-    print qq{$ME2 version $VERSION\n};
+    print qq{$ME2 version $DISPLAY_VERSION\n};
     exit 0;
 }
 
@@ -1928,6 +1933,7 @@ our $action_info = {
  query_time          => [1, 'Checks the maximum running time of current queries.'],
  replicate_row       => [0, 'Verify a simple update gets replicated to another server.'],
  replication_slots   => [1, 'Check the replication delay for replication slots'],
+ rollback_activity   => [0, 'Check recent rollback activity since the previous execution.'],
  same_schema         => [0, 'Verify that two databases have the exact same tables, columns, etc.'],
  sequence            => [0, 'Checks remaining calls left in sequences.'],
  settings_checksum   => [0, 'Check that no settings have changed since the last check.'],
@@ -1955,7 +1961,7 @@ if ($opt{help}) {
     print qq{Usage: $ME2 <options>
 Run various tests against one or more Postgres databases.
 Returns with an exit code of 0 (success), 1 (warning), 2 (critical), or 3 (unknown)
-This is version $VERSION.
+This is version $DISPLAY_VERSION.
 
 Common connection options:
  -H,  --host=NAME       hostname(s) to connect to; defaults to none (Unix socket)
@@ -1983,6 +1989,9 @@ Other options:
   --assume-standby-mode assume that server in continious WAL recovery mode
   --assume-prod         assume that server in production mode
   --assume-async        assume that any replication is asynchronous
+  --state-file=PATH     persistent baseline for the rollback_activity action
+  --min-xact-rate=NUM   minimum transactions/second gate for rollback_activity
+  --min-rollback-rate=NUM minimum rollbacks/second gate for rollback_activity
   --PGBINDIR=PATH       path of the postgresql binaries; avoid using if possible
   --PSQL=FILE           (deprecated) location of the psql executable; avoid using if possible
   -v, --verbose         verbosity level; can be used more than once to increase the level
@@ -2677,6 +2686,9 @@ check_connection() if $action eq 'connection';
 ## Check the commitratio of one or more databases
 check_commitratio() if $action eq 'commitratio';
 
+## Check recent rollback activity since the previous execution
+check_rollback_activity() if $action eq 'rollback_activity';
+
 ## Check the hitratio of one or more databases
 check_hitratio() if $action eq 'hitratio';
 
@@ -2862,9 +2874,10 @@ sub build_symlinks {
         or die msgn('symlink-name');
 
     my $force = $action =~ /force/ ? 1 : 0;
+    my $prefix = $ME =~ /^check_postgresql/ ? 'check_postgresql' : 'check_postgres';
     for my $action (sort keys %$action_info) {
         my $space = ' ' x ($longname - length $action);
-        my $file = "check_postgres_$action";
+        my $file = "${prefix}_$action";
         if (-l $file) {
             if (!$force) {
                 my $source = readlink $file;
@@ -4884,6 +4897,285 @@ $USERWHERECLAUSE
     return;
 
 } ## end of check_commitratio
+
+
+sub invalid_rollback_activity_state {
+
+    my $state_file = shift;
+    ndie qq{Invalid rollback_activity state file "$state_file"};
+
+} ## end of invalid_rollback_activity_state
+
+
+sub rollback_activity_state_decode {
+
+    my ($encoded, $state_file) = @_;
+    $encoded =~ /\A(?:[0-9a-f]{2})+\z/
+        or invalid_rollback_activity_state($state_file);
+    my $decoded = pack 'H*', $encoded;
+    utf8::decode($decoded)
+        or invalid_rollback_activity_state($state_file);
+    return $decoded;
+
+} ## end of rollback_activity_state_decode
+
+
+sub rollback_activity_state_encode {
+
+    my $value = shift;
+    utf8::encode($value);
+    return unpack 'H*', $value;
+
+} ## end of rollback_activity_state_encode
+
+
+sub read_rollback_activity_state {
+
+    my $state_file = shift;
+    my $state = {format => 1, targets => {}};
+    open my $state_fh, '<', $state_file
+        or ndie qq{Could not read rollback_activity state file "$state_file": $!};
+
+    my $header = <$state_fh>;
+    defined $header and $header eq "check_postgresql rollback_activity state 1\n"
+        or invalid_rollback_activity_state($state_file);
+
+    my $record_count = 0;
+    my $footer_count;
+    while (my $line = <$state_fh>) {
+        chomp $line;
+        if ($line =~ /\Aend\t(\d+)\z/) {
+            !defined $footer_count
+                or invalid_rollback_activity_state($state_file);
+            $footer_count = 0 + $1;
+            next;
+        }
+        !defined $footer_count
+            or invalid_rollback_activity_state($state_file);
+        my @field = split /\t/, $line, -1;
+        @field == 8
+            or invalid_rollback_activity_state($state_file);
+        $field[0] eq '1'
+            or invalid_rollback_activity_state($state_file);
+        for my $number (@field[3, 7]) {
+            $number =~ /\A\d+(?:\.\d+)?\z/
+                or invalid_rollback_activity_state($state_file);
+        }
+        for my $integer (@field[4..6]) {
+            $integer =~ /\A\d+\z/
+                or invalid_rollback_activity_state($state_file);
+        }
+
+        my $target = rollback_activity_state_decode($field[1], $state_file);
+        my $dbname = rollback_activity_state_decode($field[2], $state_file);
+        !exists $state->{targets}{$target}{$dbname}
+            or invalid_rollback_activity_state($state_file);
+        $state->{targets}{$target}{$dbname} = {
+            sample_time  => 0 + $field[3],
+            database_oid => 0 + $field[4],
+            commit       => 0 + $field[5],
+            rollback     => 0 + $field[6],
+            stats_reset  => 0 + $field[7],
+        };
+        $record_count++;
+    }
+    defined $footer_count and $footer_count == $record_count
+        or invalid_rollback_activity_state($state_file);
+    close $state_fh
+        or ndie qq{Could not close rollback_activity state file "$state_file": $!};
+
+    return $state;
+
+} ## end of read_rollback_activity_state
+
+
+sub write_rollback_activity_state {
+
+    my ($state, $state_dir, $state_file) = @_;
+    my ($state_fh, $temp_state_file);
+
+    eval {
+        ($state_fh, $temp_state_file) = tempfile(
+            '.check_postgresql_rollback_activity.XXXXXX',
+            DIR => $state_dir,
+            UNLINK => 0,
+        );
+        print {$state_fh} "check_postgresql rollback_activity state 1\n"
+            or die qq{Could not write "$temp_state_file": $!\n};
+        my $record_count = 0;
+        for my $target (sort keys %{$state->{targets}}) {
+            for my $dbname (sort keys %{$state->{targets}{$target}}) {
+                my $data = $state->{targets}{$target}{$dbname};
+                printf {$state_fh} "1\t%s\t%s\t%.6f\t%d\t%d\t%d\t%.6f\n",
+                    rollback_activity_state_encode($target),
+                    rollback_activity_state_encode($dbname),
+                    $data->{sample_time},
+                    $data->{database_oid},
+                    $data->{commit},
+                    $data->{rollback},
+                    $data->{stats_reset}
+                    or die qq{Could not write "$temp_state_file": $!\n};
+                $record_count++;
+            }
+        }
+        print {$state_fh} "end\t$record_count\n"
+            or die qq{Could not write "$temp_state_file": $!\n};
+        close $state_fh
+            or die qq{Could not close "$temp_state_file": $!\n};
+        rename $temp_state_file, $state_file
+            or die qq{Could not replace "$state_file": $!\n};
+    };
+    if ($@) {
+        my $error = $@;
+        close $state_fh if defined $state_fh and defined fileno $state_fh;
+        unlink $temp_state_file if defined $temp_state_file and -e $temp_state_file;
+        ndie qq{Could not write rollback_activity state file "$state_file": $error};
+    }
+
+    return;
+
+} ## end of write_rollback_activity_state
+
+
+sub check_rollback_activity {
+
+    ## Check recent transaction activity using a persistent counter baseline
+
+    my ($warning, $critical) = validate_range({type => 'percent'});
+    if ((length $warning and $warning > 100) or (length $critical and $critical > 100)) {
+        ndie q{rollback_activity percentages cannot exceed 100%};
+    }
+    if (length $warning and length $critical and $warning > $critical) {
+        ndie q{rollback_activity warning percentage cannot exceed critical percentage};
+    }
+
+    my $min_xact_rate = $opt{'min-xact-rate'} // 0;
+    my $min_rollback_rate = $opt{'min-rollback-rate'} // 0;
+    $min_xact_rate >= 0
+        or ndie q{rollback_activity --min-xact-rate cannot be negative};
+    $min_rollback_rate >= 0
+        or ndie q{rollback_activity --min-rollback-rate cannot be negative};
+
+    my $state_file = $opt{'state-file'} || ndie q{rollback_activity requires --state-file};
+    file_name_is_absolute($state_file)
+        or ndie q{rollback_activity --state-file must be an absolute path};
+    my $state_dir = dirname($state_file);
+    -d $state_dir and -w $state_dir
+        or ndie qq{Cannot write rollback_activity state directory "$state_dir"};
+
+    open my $lock_fh, '>>', "$state_file.lock"
+        or ndie qq{Could not open rollback_activity state lock "$state_file.lock": $!};
+    flock $lock_fh, LOCK_EX | LOCK_NB
+        or ndie qq{rollback_activity is already running with state file "$state_file"};
+
+    my $previous = {format => 1, targets => {}};
+    if (-e $state_file) {
+        $previous = read_rollback_activity_state($state_file);
+    }
+
+    $SQL = q{
+SELECT
+  extract(epoch FROM clock_timestamp()) AS sample_time,
+  d.datname,
+  d.oid AS database_oid,
+  sd.xact_commit,
+  sd.xact_rollback,
+  COALESCE(extract(epoch FROM sd.stats_reset), 0) AS stats_reset
+FROM pg_stat_database sd
+JOIN pg_database d ON (d.oid=sd.datid)
+WHERE d.datallowconn
+ORDER BY d.datname
+};
+
+    my $info = run_command($SQL, { regex => qr{\d+}, emptyok => 1 });
+    my $state = {format => 1, targets => {}};
+    my $evaluated = 0;
+    my $matched = 0;
+    my $multiple_targets = @{$info->{db}} > 1;
+    my $target_number = 0;
+
+    for $db (@{$info->{db}}) {
+        next if exists $db->{fail};
+        $target_number++;
+        my $target = $db->{pname};
+        my $previous_target = $previous->{targets}{$target} || {};
+        my $current_target = $state->{targets}{$target} = {};
+        my @critical_msg;
+        my @warning_msg;
+        my @ok_msg;
+
+        for my $row (@{$db->{slurp}}) {
+            next if skip_item($row->{datname});
+            $matched++;
+            my $dbname = $row->{datname};
+            my $current = $current_target->{$dbname} = {
+                sample_time  => 0 + $row->{sample_time},
+                database_oid => 0 + $row->{database_oid},
+                commit       => 0 + $row->{xact_commit},
+                rollback     => 0 + $row->{xact_rollback},
+                stats_reset  => 0 + $row->{stats_reset},
+            };
+
+            my $old = $previous_target->{$dbname};
+            next if ref $old ne 'HASH';
+            next if $current->{database_oid} != $old->{database_oid};
+            next if $current->{stats_reset} != $old->{stats_reset};
+
+            my $elapsed = $current->{sample_time} - $old->{sample_time};
+            my $commits = $current->{commit} - $old->{commit};
+            my $rollbacks = $current->{rollback} - $old->{rollback};
+            next if $elapsed <= 0 or $commits < 0 or $rollbacks < 0;
+
+            my $transactions = $commits + $rollbacks;
+            my $commit_rate = $commits / $elapsed;
+            my $rollback_rate = $rollbacks / $elapsed;
+            my $xact_rate = $transactions / $elapsed;
+            my $rollback_ratio = $transactions ? 100 * $rollbacks / $transactions : 0;
+            $evaluated++;
+
+            my $perf_prefix = $multiple_targets ? "target${target_number}_${dbname}" : $dbname;
+            $db->{perf} .= sprintf ' %s=%.2f %s=%.2f %s=%.2f %s=%.2f%%;%s;%s;0;100',
+                perfname("${perf_prefix}_commit_rate"), $commit_rate,
+                perfname("${perf_prefix}_rollback_rate"), $rollback_rate,
+                perfname("${perf_prefix}_xact_rate"), $xact_rate,
+                perfname("${perf_prefix}_rollback_ratio"), $rollback_ratio,
+                $warning, $critical;
+
+            my $msg = sprintf '%s rollback %.2f%% (%.2f/s of %.2f tx/s)',
+                $dbname, $rollback_ratio, $rollback_rate, $xact_rate;
+            my $volume_is_significant = ($xact_rate >= $min_xact_rate
+                and $rollback_rate >= $min_rollback_rate);
+
+            if ($volume_is_significant and length $critical and $rollback_ratio > $critical) {
+                push @critical_msg => $msg;
+            }
+            elsif ($volume_is_significant and length $warning and $rollback_ratio > $warning) {
+                push @warning_msg => $msg;
+            }
+            else {
+                push @ok_msg => $msg;
+            }
+        }
+
+        if (@critical_msg) {
+            add_critical join '; ' => @critical_msg, @warning_msg;
+        }
+        elsif (@warning_msg) {
+            add_warning join '; ' => @warning_msg;
+        }
+        elsif (@ok_msg) {
+            add_ok join '; ' => @ok_msg;
+        }
+    }
+
+    $matched or ndie q{No matching databases found for rollback_activity};
+
+    write_rollback_activity_state($state, $state_dir, $state_file);
+
+    add_ok q{initial baseline recorded} if !$evaluated;
+    return;
+
+} ## end of check_rollback_activity
 
 
 sub check_connection {
@@ -9462,7 +9754,7 @@ sub check_wal_files {
 
 B<check_postgres.pl> - a Postgres monitoring script for Nagios, MRTG, Cacti, and others
 
-This documents describes check_postgres.pl version 2.26.0
+This documents check_postgres.pl version 2.26.0 with Hosted Power fork revision hp1.
 
 =head1 SYNOPSIS
 
@@ -9659,6 +9951,22 @@ option depends on the action used.
 
 Sets the threshold at which a critical alert is fired. The valid options for this 
 option depends on the action used.
+
+=item B<--state-file=PATH>
+
+Sets the persistent counter baseline used by the B<rollback_activity> action.
+Use a unique absolute path for each monitoring service. The containing directory must
+already exist and be writable by the monitoring user.
+
+=item B<--min-xact-rate=NUM>
+
+Sets the minimum recent transaction rate, in transactions per second, required before
+the B<rollback_activity> action may alert. The default is zero.
+
+=item B<--min-rollback-rate=NUM>
+
+Sets the minimum recent rollback rate, in rollbacks per second, required before the
+B<rollback_activity> action may alert. The default is zero.
 
 =item B<-t VAL> or B<--timeout=VAL>
 
@@ -10926,6 +11234,53 @@ Warning and critical are total bytes retained for the slot. E.g:
   check_postgres_replication_slots --port=5432 --host=yellow -warning=32M -critical=64M
 
 Specific named slots can be monitored using --include/--exclude
+
+=head2 B<rollback_activity>
+
+(C<symlink: check_postgresql_rollback_activity>) Checks recent rollback activity from
+the change in C<pg_stat_database> transaction counters since the previous execution.
+Unlike B<commitratio>, this action does not evaluate the lifetime ratio accumulated
+since PostgreSQL statistics were last reset.
+
+The I<--warning> and I<--critical> values are optional percentages. A database alerts
+only when its recent rollback percentage is greater than the configured threshold
+I<and> both of these volume gates are met:
+
+=over 4
+
+=item * I<--min-xact-rate> - recent commits plus rollbacks per second
+
+=item * I<--min-rollback-rate> - recent rollbacks per second
+
+=back
+
+Both gates default to zero. Set them explicitly when low-volume rollback bursts should
+not alert. The action emits commit rate, rollback rate, total transaction rate, and
+rollback percentage as Nagios performance data; it does not require Graphite or any
+other time-series system. PostgreSQL's transaction counters do not identify why a
+transaction rolled back, so this action detects major recent rollback activity rather
+than individual PostgreSQL or application errors.
+
+The I<--state-file> option requires an absolute path. The first execution records a
+baseline and returns OK. Updates are locked and atomically replaced. New databases, counter
+decreases, PostgreSQL statistics resets, and non-positive sample intervals refresh the
+affected baseline without alerting. Use a different state file for every separately
+scheduled service check; one invocation may still check multiple connection targets.
+For a multi-target invocation, performance labels are prefixed with C<target1_>,
+C<target2_>, and so on to remain unique. Databases can be selected with I<--include>
+and I<--exclude>.
+
+This action requires PostgreSQL 9.1 or newer.
+
+Example conservative rollback-storm policy: warn when more than half of recent
+transactions roll back and become critical above 75%, but only when the database is
+processing at least one transaction and one rollback per second. These values are an
+explicit policy example, not built-in defaults:
+
+  check_postgresql --action=rollback_activity \
+    --warning=50% --critical=75% \
+    --min-xact-rate=1 --min-rollback-rate=1 \
+    --state-file=/var/lib/icinga2/check_postgresql/rollback_activity.state
 
 =head2 B<same_schema>
 

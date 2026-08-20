@@ -83,6 +83,7 @@
       <li><a href="#query_time">query_time</a></li>
       <li><a href="#replicate_row">replicate_row</a></li>
       <li><a href="#replication_slots">replication_slots</a></li>
+      <li><a href="#rollback_activity">rollback_activity</a></li>
       <li><a href="#same_schema">same_schema</a></li>
       <li><a href="#sequence1">sequence</a></li>
       <li><a href="#settings_checksum">settings_checksum</a></li>
@@ -117,7 +118,7 @@
 
 <p><b>check_postgres.pl</b> - a Postgres monitoring script for Nagios, MRTG, Cacti, and others</p>
 
-<p>This documents describes check_postgres.pl version 2.26.0</p>
+<p>This documents check_postgres.pl version 2.26.0 with Hosted Power fork revision hp1.</p>
 
 <h1 id="SYNOPSIS">SYNOPSIS</h1>
 
@@ -288,6 +289,24 @@ Connects using the named service &#39;foo&#39; in the pg_service.conf file, but 
 <dd>
 
 <p>Sets the threshold at which a critical alert is fired. The valid options for this option depends on the action used.</p>
+
+</dd>
+<dt id="state-file-PATH"><b>--state-file=PATH</b></dt>
+<dd>
+
+<p>Sets the persistent counter baseline used by the <b>rollback_activity</b> action. Use a unique absolute path for each monitoring service. The containing directory must already exist and be writable by the monitoring user.</p>
+
+</dd>
+<dt id="min-xact-rate-NUM"><b>--min-xact-rate=NUM</b></dt>
+<dd>
+
+<p>Sets the minimum recent transaction rate, in transactions per second, required before the <b>rollback_activity</b> action may alert. The default is zero.</p>
+
+</dd>
+<dt id="min-rollback-rate-NUM"><b>--min-rollback-rate=NUM</b></dt>
+<dd>
+
+<p>Sets the minimum recent rollback rate, in rollbacks per second, required before the <b>rollback_activity</b> action may alert. The default is zero.</p>
 
 </dd>
 <dt id="t-VAL-or---timeout-VAL"><b>-t VAL</b> or <b>--timeout=VAL</b></dt>
@@ -1182,6 +1201,35 @@ check_postgres_prepared_txns --critical=360 --include=shrike</code></pre>
 
 <p>Specific named slots can be monitored using --include/--exclude</p>
 
+<h2 id="rollback_activity"><b>rollback_activity</b></h2>
+
+<p>(<code>symlink: check_postgresql_rollback_activity</code>) Checks recent rollback activity from the change in <code>pg_stat_database</code> transaction counters since the previous execution. Unlike <b>commitratio</b>, this action does not evaluate the lifetime ratio accumulated since PostgreSQL statistics were last reset.</p>
+
+<p>The <i>--warning</i> and <i>--critical</i> values are optional percentages. A database alerts only when its recent rollback percentage is greater than the configured threshold <i>and</i> both of these volume gates are met:</p>
+
+<ul>
+
+<li><p><i>--min-xact-rate</i> - recent commits plus rollbacks per second</p>
+
+</li>
+<li><p><i>--min-rollback-rate</i> - recent rollbacks per second</p>
+
+</li>
+</ul>
+
+<p>Both gates default to zero. Set them explicitly when low-volume rollback bursts should not alert. The action emits commit rate, rollback rate, total transaction rate, and rollback percentage as Nagios performance data; it does not require Graphite or any other time-series system. PostgreSQL&#39;s transaction counters do not identify why a transaction rolled back, so this action detects major recent rollback activity rather than individual PostgreSQL or application errors.</p>
+
+<p>The <i>--state-file</i> option requires an absolute path. The first execution records a baseline and returns OK. Updates are locked and atomically replaced. New databases, counter decreases, PostgreSQL statistics resets, and non-positive sample intervals refresh the affected baseline without alerting. Use a different state file for every separately scheduled service check; one invocation may still check multiple connection targets. For a multi-target invocation, performance labels are prefixed with <code>target1_</code>, <code>target2_</code>, and so on to remain unique. Databases can be selected with <i>--include</i> and <i>--exclude</i>.</p>
+
+<p>This action requires PostgreSQL 9.1 or newer.</p>
+
+<p>Example conservative rollback-storm policy: warn when more than half of recent transactions roll back and become critical above 75%, but only when the database is processing at least one transaction and one rollback per second. These values are an explicit policy example, not built-in defaults:</p>
+
+<pre><code>check_postgresql --action=rollback_activity \
+  --warning=50% --critical=75% \
+  --min-xact-rate=1 --min-rollback-rate=1 \
+  --state-file=/var/lib/icinga2/check_postgresql/rollback_activity.state</code></pre>
+
 <h2 id="same_schema"><b>same_schema</b></h2>
 
 <p>(<code>symlink: check_postgres_same_schema</code>) Verifies that two or more databases are identical as far as their schema (but not the data within). Unlike most other actions, this has no warning or critical criteria - the databases are either in sync, or are not. If they are different, a detailed list of the differences is presented.</p>
@@ -1625,7 +1673,7 @@ git clone https://github.com/bucardo/check_postgres.git</code></pre>
 (Github user miraclesvenni)
 [Github issue #154]
 
-Raise minimum version or Perl to 5.10.0
+Raise minimum version of Perl to 5.10.0
 
 Allow commas in passwords via --dbpass for one-connection queries (Greg Sabino Mullane) [Github issue #133]
 

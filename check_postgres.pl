@@ -36,6 +36,17 @@ $Data::Dumper::Useqq = 1;
 binmode STDOUT, ':encoding(UTF-8)';
 
 our $VERSION = '2.26.0';
+
+## rollback_activity: where the baseline lives when neither --audit-file-dir
+## nor --tempdir is given, and the volume gates applied when none are named.
+our $DEFAULT_STATE_DIR = '/var/lib/check_postgres';
+our $DEFAULT_MIN_XACT_RATE = 1;
+our $DEFAULT_MIN_ROLLBACK_RATE = 0.1;
+our %ROLLBACK_ACTIVITY_KEYS = (
+    ratio    => 'ratio',
+    minxact  => 'minxact',
+    minrb    => 'minrb',
+);
 our $DISPLAY_VERSION = "$VERSION-hp1";
 our $COMMA = ',';
 
@@ -1714,9 +1725,6 @@ GetOptions(
     'PSQL=s',
 
     'tempdir=s',
-    'state-file=s', ## used by rollback_activity only
-    'min-xact-rate=f', ## used by rollback_activity only
-    'min-rollback-rate=f', ## used by rollback_activity only
     'audit-file-dir=s',
     'get_method=s',
     'language=s',
@@ -1989,9 +1997,6 @@ Other options:
   --assume-standby-mode assume that server in continious WAL recovery mode
   --assume-prod         assume that server in production mode
   --assume-async        assume that any replication is asynchronous
-  --state-file=PATH     persistent baseline for the rollback_activity action
-  --min-xact-rate=NUM   minimum transactions/second gate for rollback_activity
-  --min-rollback-rate=NUM minimum rollbacks/second gate for rollback_activity
   --PGBINDIR=PATH       path of the postgresql binaries; avoid using if possible
   --PSQL=FILE           (deprecated) location of the psql executable; avoid using if possible
   -v, --verbose         verbosity level; can be used more than once to increase the level
@@ -4899,6 +4904,76 @@ $USERWHERECLAUSE
 } ## end of check_commitratio
 
 
+sub parse_rollback_activity_range {
+
+    ## Accept a plain rollback percentage, or a key=value list carrying the
+    ## volume gates alongside it. Returns (ratio, min_xact_rate, min_rollback_rate),
+    ## any of which may be undef. Kept local rather than extending the shared
+    ## 'multival' type, which only parses integers and is used by check_locks.
+
+    my ($raw, $which) = @_;
+    return ('', undef, undef) if !defined $raw or !length $raw;
+
+    my $num = qr{\d+(?:\.\d+)?};
+
+    ## Plain form: 75 or 75%
+    if ($raw =~ /\A\s*($num)\s*%?\s*\z/) {
+        my $ratio = $1;
+        $ratio <= 100 or ndie qq{rollback_activity $which percentage cannot exceed 100%};
+        return ($ratio, undef, undef);
+    }
+
+    ## Keyed form: ratio=75:minxact=1:minrb=0.1
+    my %val;
+    for my $pair (split /[:,]/ => $raw) {
+        next if $pair !~ /\S/;
+        $pair =~ /\A\s*(\w+)\s*=\s*($num)\s*%?\s*\z/
+            or ndie qq{Invalid rollback_activity $which threshold "$raw"};
+        my ($name, $value) = (lc $1, $2);
+        exists $ROLLBACK_ACTIVITY_KEYS{$name}
+            or ndie qq{Unknown rollback_activity $which key "$name"};
+        $val{ $ROLLBACK_ACTIVITY_KEYS{$name} } = $value;
+    }
+    keys %val or ndie qq{Invalid rollback_activity $which threshold "$raw"};
+
+    if (defined $val{ratio}) {
+        $val{ratio} <= 100 or ndie qq{rollback_activity $which percentage cannot exceed 100%};
+    }
+
+    return (defined $val{ratio} ? $val{ratio} : '', $val{minxact}, $val{minrb});
+
+} ## end of parse_rollback_activity_range
+
+
+sub rollback_activity_state_dir {
+
+    ## Where to keep the rollback_activity baseline.
+    ## Follows the same precedence the audit file uses, and refuses a directory
+    ## that anyone else could write into: the file name is derived from the
+    ## connection string and is therefore predictable, so a shared directory
+    ## such as /tmp would let a local user pre-create or poison the baseline.
+
+    my $dir = $opt{'audit-file-dir'} // $opt{tempdir} // $DEFAULT_STATE_DIR;
+
+    if (! -d $dir) {
+        mkdir $dir, 0700
+            or ndie qq{Could not create state directory "$dir": $!};
+    }
+
+    my @stat = stat $dir
+        or ndie qq{Could not stat state directory "$dir": $!};
+    my ($mode, $owner) = ($stat[2], $stat[4]);
+
+    ($mode & 0022) == 0
+        or ndie qq{Refusing to use state directory "$dir": writable by group or other};
+    ($owner == 0 or $owner == $>)
+        or ndie qq{Refusing to use state directory "$dir": not owned by root or the current user};
+
+    return $dir;
+
+} ## end of rollback_activity_state_dir
+
+
 sub invalid_rollback_activity_state {
 
     my $state_file = shift;
@@ -5041,27 +5116,26 @@ sub check_rollback_activity {
 
     ## Check recent transaction activity using a persistent counter baseline
 
-    my ($warning, $critical) = validate_range({type => 'percent'});
-    if ((length $warning and $warning > 100) or (length $critical and $critical > 100)) {
-        ndie q{rollback_activity percentages cannot exceed 100%};
-    }
+    ## Thresholds are a rollback percentage, optionally carrying the volume
+    ## gates in the same argument the way check_locks does, for example:
+    ##   --critical='75%'
+    ##   --critical='ratio=75:minxact=1:minrb=0.1'
+    my ($warning, $min_xact_rate, $min_rollback_rate)
+        = parse_rollback_activity_range($opt{warning}, 'warning');
+    my ($critical, $c_xact, $c_rollback)
+        = parse_rollback_activity_range($opt{critical}, 'critical');
+    ## Gates are filters rather than severities: critical wins when both name one
+    $min_xact_rate = $c_xact if defined $c_xact;
+    $min_rollback_rate = $c_rollback if defined $c_rollback;
+    $min_xact_rate //= $DEFAULT_MIN_XACT_RATE;
+    $min_rollback_rate //= $DEFAULT_MIN_ROLLBACK_RATE;
+
     if (length $warning and length $critical and $warning > $critical) {
         ndie q{rollback_activity warning percentage cannot exceed critical percentage};
     }
 
-    my $min_xact_rate = $opt{'min-xact-rate'} // 0;
-    my $min_rollback_rate = $opt{'min-rollback-rate'} // 0;
-    $min_xact_rate >= 0
-        or ndie q{rollback_activity --min-xact-rate cannot be negative};
-    $min_rollback_rate >= 0
-        or ndie q{rollback_activity --min-rollback-rate cannot be negative};
-
-    my $state_file = $opt{'state-file'} || ndie q{rollback_activity requires --state-file};
-    file_name_is_absolute($state_file)
-        or ndie q{rollback_activity --state-file must be an absolute path};
-    my $state_dir = dirname($state_file);
-    -d $state_dir and -w $state_dir
-        or ndie qq{Cannot write rollback_activity state directory "$state_dir"};
+    my $state_dir = rollback_activity_state_dir();
+    my $state_file = catfile($state_dir, audit_filename('rollback_activity'));
 
     open my $lock_fh, '>>', "$state_file.lock"
         or ndie qq{Could not open rollback_activity state lock "$state_file.lock": $!};
@@ -8377,6 +8451,9 @@ sub check_same_schema {
 sub audit_filename {
 
     ## Generate the name of the file to store audit information
+    ## An optional label distinguishes files written by different actions
+
+    my $label = shift || 'audit';
 
     ## Get the connection information for this connection
     my $filename = run_command('foo', { conninfo => 1 });
@@ -8389,7 +8466,7 @@ sub audit_filename {
     ## Equals have to be escaped, so we'll change them to a dot
     $filename =~ s/=/./g;
     ## The final filename to use
-    $filename = "check_postgres.audit.$filename";
+    $filename = "check_postgres.$label.$filename";
 
     ## The host name may have slashes, so change to underscores
     $filename =~ s{\/}{_}g;
@@ -9952,22 +10029,6 @@ option depends on the action used.
 Sets the threshold at which a critical alert is fired. The valid options for this 
 option depends on the action used.
 
-=item B<--state-file=PATH>
-
-Sets the persistent counter baseline used by the B<rollback_activity> action.
-Use a unique absolute path for each monitoring service. The containing directory must
-already exist and be writable by the monitoring user.
-
-=item B<--min-xact-rate=NUM>
-
-Sets the minimum recent transaction rate, in transactions per second, required before
-the B<rollback_activity> action may alert. The default is zero.
-
-=item B<--min-rollback-rate=NUM>
-
-Sets the minimum recent rollback rate, in rollbacks per second, required before the
-B<rollback_activity> action may alert. The default is zero.
-
 =item B<-t VAL> or B<--timeout=VAL>
 
 Sets the timeout in seconds after which the script will abort whatever it is doing 
@@ -11242,30 +11303,39 @@ the change in C<pg_stat_database> transaction counters since the previous execut
 Unlike B<commitratio>, this action does not evaluate the lifetime ratio accumulated
 since PostgreSQL statistics were last reset.
 
-The I<--warning> and I<--critical> values are optional percentages. A database alerts
-only when its recent rollback percentage is greater than the configured threshold
-I<and> both of these volume gates are met:
+The I<--warning> and I<--critical> values are a rollback percentage. They may also
+carry the volume gates in the same argument, in the style used by the B<locks> action:
 
 =over 4
 
-=item * I<--min-xact-rate> - recent commits plus rollbacks per second
+=item * C<ratio> - the rollback percentage above which the database alerts
 
-=item * I<--min-rollback-rate> - recent rollbacks per second
+=item * C<minxact> - recent commits plus rollbacks per second, below which the database is skipped
+
+=item * C<minrb> - recent rollbacks per second, below which the database is skipped
 
 =back
 
-Both gates default to zero. Set them explicitly when low-volume rollback bursts should
-not alert. The action emits commit rate, rollback rate, total transaction rate, and
-rollback percentage as Nagios performance data; it does not require Graphite or any
-other time-series system. PostgreSQL's transaction counters do not identify why a
-transaction rolled back, so this action detects major recent rollback activity rather
-than individual PostgreSQL or application errors.
+So C<--critical='75%'> and C<--critical='ratio=75:minxact=1:minrb=0.1'> are both valid.
+The gates default to one transaction and 0.1 rollbacks per second, so that a database
+with almost no traffic is not judged on a handful of samples. A skipped database
+reports OK. Gates named on I<--critical> take precedence over those on I<--warning>,
+as they filter rather than set a severity.
 
-The I<--state-file> option requires an absolute path. The first execution records a
-baseline and returns OK. Updates are locked and atomically replaced. New databases, counter
+The action emits commit rate, rollback rate, total transaction rate, and rollback
+percentage as Nagios performance data; it does not require Graphite or any other
+time-series system. PostgreSQL's transaction counters do not identify why a transaction
+rolled back, so this action detects major recent rollback activity rather than
+individual PostgreSQL or application errors.
+
+The baseline is stored in a file named after the connection string, in the directory
+given by I<--audit-file-dir>, else I<--tempdir>, else F</var/lib/check_postgres>. The
+directory is created if missing, and is refused if it is writable by group or other, or
+owned by anyone but root or the current user: the file name is predictable, so a shared
+directory such as F</tmp> would let a local user pre-create or poison the baseline.
+The first execution records a baseline and returns OK. Updates are locked and atomically replaced. New databases, counter
 decreases, PostgreSQL statistics resets, and non-positive sample intervals refresh the
-affected baseline without alerting. Use a different state file for every separately
-scheduled service check; one invocation may still check multiple connection targets.
+affected baseline without alerting. One invocation may check multiple connection targets.
 For a multi-target invocation, performance labels are prefixed with C<target1_>,
 C<target2_>, and so on to remain unique. Databases can be selected with I<--include>
 and I<--exclude>.
@@ -11273,14 +11343,14 @@ and I<--exclude>.
 This action requires PostgreSQL 9.1 or newer.
 
 Example conservative rollback-storm policy: warn when more than half of recent
-transactions roll back and become critical above 75%, but only when the database is
-processing at least one transaction and one rollback per second. These values are an
-explicit policy example, not built-in defaults:
+transactions roll back, and go critical above 75%:
+
+  check_postgresql --action=rollback_activity --warning=50% --critical=75%
+
+The same policy with the volume gates named explicitly:
 
   check_postgresql --action=rollback_activity \
-    --warning=50% --critical=75% \
-    --min-xact-rate=1 --min-rollback-rate=1 \
-    --state-file=/var/lib/icinga2/check_postgresql/rollback_activity.state
+    --warning=50% --critical='ratio=75:minxact=1:minrb=0.1'
 
 =head2 B<same_schema>
 

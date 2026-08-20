@@ -15,8 +15,19 @@ use CP_Testing;
 
 my $cp = CP_Testing->new({default_action => 'rollback_activity'});
 my $dbh = $cp->test_database_handle();
-my $state_dir = tempdir('check_postgresql.XXXXXX', TMPDIR => 1, CLEANUP => 1);
-my $state_file = catfile($state_dir, 'rollback_activity.state');
+sub fresh_state_dir {
+    ## File::Temp gives 0700, which is what the action insists on
+    return tempdir('check_postgresql.XXXXXX', TMPDIR => 1, CLEANUP => 1);
+}
+
+sub state_file_in {
+    ## The action names the file after the connection string
+    my $dir = shift;
+    my ($found) = glob catfile($dir, 'check_postgres.rollback_activity.*');
+    return $found;
+}
+
+my $state_dir = fresh_state_dir();
 
 sub generate_activity {
     my ($rollbacks, $commits) = @_;
@@ -57,16 +68,16 @@ sub write_state_file {
     return;
 }
 
-my $result = $cp->run(qq{--state-file="$state_file"});
+my $result = $cp->run(qq{--audit-file-dir="$state_dir"});
 
 like(
     $result,
     qr{^POSTGRES_ROLLBACK_ACTIVITY OK:.*initial baseline}i,
     q{Action 'rollback_activity' records an initial baseline without alarming}
 );
-ok(-s $state_file, q{Action 'rollback_activity' writes its state file});
+ok(-s state_file_in($state_dir), q{Action 'rollback_activity' writes its state file});
 like(
-    read_state_file($state_file),
+    read_state_file(state_file_in($state_dir)),
     qr{\Acheck_postgresql rollback_activity state 1\n.*\nend\t\d+\n\z}s,
     q{Action 'rollback_activity' uses a versioned primitive state format}
 );
@@ -75,8 +86,7 @@ $dbh->disconnect();
 generate_activity(5, 1);
 
 $result = $cp->run(
-    qq{--state-file="$state_file" --warning=1% --critical=2% }
-    . q{--min-xact-rate=0 --min-rollback-rate=0}
+    qq{--audit-file-dir="$state_dir" --warning=1% --critical='ratio=2:minxact=0:minrb=0'}
 );
 
 like(
@@ -90,12 +100,11 @@ unlike(
     q{Action 'rollback_activity' emits portable unitless per-second rate perfdata}
 );
 
-my $warning_state_file = catfile($state_dir, 'warning.state');
-$cp->run(qq{--state-file="$warning_state_file"});
+my $warning_dir = fresh_state_dir();
+$cp->run(qq{--audit-file-dir="$warning_dir"});
 generate_activity(5, 1);
 $result = $cp->run(
-    qq{--state-file="$warning_state_file" --warning=1% --critical=100% }
-    . q{--min-xact-rate=0 --min-rollback-rate=0}
+    qq{--audit-file-dir="$warning_dir" --warning=1% --critical='ratio=100:minxact=0:minrb=0'}
 );
 like(
     $result,
@@ -103,12 +112,11 @@ like(
     q{Action 'rollback_activity' reports warning activity below the critical threshold}
 );
 
-my $gated_state_file = catfile($state_dir, 'gated.state');
-$cp->run(qq{--state-file="$gated_state_file"});
+my $gated_dir = fresh_state_dir();
+$cp->run(qq{--audit-file-dir="$gated_dir"});
 generate_activity(5, 1);
 $result = $cp->run(
-    qq{--state-file="$gated_state_file" --warning=1% --critical=2% }
-    . q{--min-xact-rate=100000 --min-rollback-rate=100000}
+    qq{--audit-file-dir="$gated_dir" --warning=1% --critical='ratio=2:minxact=100000:minrb=100000'}
 );
 like(
     $result,
@@ -116,12 +124,11 @@ like(
     q{Action 'rollback_activity' requires the ratio and both rate gates to cross}
 );
 
-my $filtered_state_file = catfile($state_dir, 'filtered.state');
-$cp->run(qq{--state-file="$filtered_state_file"});
+my $filtered_dir = fresh_state_dir();
+$cp->run(qq{--audit-file-dir="$filtered_dir"});
 generate_activity(5, 1);
 $result = $cp->run(
-    qq{--state-file="$filtered_state_file" --warning=1% --critical=2% }
-    . q{--min-xact-rate=0 --min-rollback-rate=0 --exclude=postgres}
+    qq{--audit-file-dir="$filtered_dir" --warning=1% --critical='ratio=2:minxact=0:minrb=0' --exclude=postgres}
 );
 like(
     $result,
@@ -134,10 +141,10 @@ unlike(
     q{Action 'rollback_activity' omits filtered databases from performance data}
 );
 
-my $multiple_target_state_file = catfile($state_dir, 'multiple_targets.state');
-$cp->run('rollback_activityDB2', qq{--state-file="$multiple_target_state_file"});
+my $multiple_target_dir = fresh_state_dir();
+$cp->run('rollback_activityDB2', qq{--audit-file-dir="$multiple_target_dir"});
 sleep 0.2;
-$result = $cp->run('rollback_activityDB2', qq{--state-file="$multiple_target_state_file"});
+$result = $cp->run('rollback_activityDB2', qq{--audit-file-dir="$multiple_target_dir"});
 like(
     $result,
     qr{target1_postgres_rollback_ratio=},
@@ -149,8 +156,8 @@ like(
     q{Action 'rollback_activity' qualifies the second target's duplicate database perfdata}
 );
 
-my $new_database_state_file = catfile($state_dir, 'new_database.state');
-$cp->run(qq{--state-file="$new_database_state_file"});
+my $new_database_dir = fresh_state_dir();
+$cp->run(qq{--audit-file-dir="$new_database_dir"});
 my $admin_dbh = $cp->test_database_handle({quickreturn => 1});
 $admin_dbh->commit();
 $admin_dbh->{AutoCommit} = 1;
@@ -158,8 +165,7 @@ $admin_dbh->do('CREATE DATABASE rollback_activity_new');
 $admin_dbh->disconnect();
 sleep 1.1;
 $result = $cp->run(
-    qq{--state-file="$new_database_state_file" --critical=0% }
-    . q{--min-xact-rate=0 --min-rollback-rate=0}
+    qq{--audit-file-dir="$new_database_dir" --critical='ratio=0:minxact=0:minrb=0'}
 );
 like(
     $result,
@@ -172,7 +178,7 @@ unlike(
     q{Action 'rollback_activity' does not emit perfdata before a new database has a prior sample}
 );
 sleep 0.2;
-$result = $cp->run(qq{--state-file="$new_database_state_file"});
+$result = $cp->run(qq{--audit-file-dir="$new_database_dir"});
 like(
     $result,
     qr{rollback_activity_new_rollback_ratio=},
@@ -186,8 +192,7 @@ $admin_dbh->do('CREATE DATABASE rollback_activity_new');
 $admin_dbh->disconnect();
 sleep 1.1;
 $result = $cp->run(
-    qq{--state-file="$new_database_state_file" --critical=0% }
-    . q{--min-xact-rate=0 --min-rollback-rate=0}
+    qq{--audit-file-dir="$new_database_dir" --critical='ratio=0:minxact=0:minrb=0'}
 );
 like(
     $result,
@@ -205,16 +210,15 @@ $admin_dbh->{AutoCommit} = 1;
 $admin_dbh->do('DROP DATABASE rollback_activity_new');
 $admin_dbh->disconnect();
 
-my $reset_state_file = catfile($state_dir, 'reset.state');
-$cp->run(qq{--state-file="$reset_state_file"});
+my $reset_dir = fresh_state_dir();
+$cp->run(qq{--audit-file-dir="$reset_dir"});
 my $reset_dbh = $cp->test_database_handle({quickreturn => 1});
 $reset_dbh->do('SELECT pg_stat_reset()');
 $reset_dbh->commit();
 $reset_dbh->disconnect();
 sleep 1.1;
 $result = $cp->run(
-    qq{--state-file="$reset_state_file" --warning=1% --critical=2% }
-    . q{--min-xact-rate=0 --min-rollback-rate=0}
+    qq{--audit-file-dir="$reset_dir" --warning=1% --critical='ratio=2:minxact=0:minrb=0'}
 );
 like(
     $result,
@@ -222,9 +226,9 @@ like(
     q{Action 'rollback_activity' refreshes its baseline after PostgreSQL statistics reset}
 );
 
-my $decreasing_state_file = catfile($state_dir, 'decreasing.state');
-$cp->run(qq{--state-file="$decreasing_state_file"});
-my @state_line = split /\n/, read_state_file($decreasing_state_file), -1;
+my $decreasing_dir = fresh_state_dir();
+$cp->run(qq{--audit-file-dir="$decreasing_dir"});
+my @state_line = split /\n/, read_state_file(state_file_in($decreasing_dir)), -1;
 my $postgres_hex = unpack 'H*', 'postgres';
 for my $line (@state_line) {
     my @field = split /\t/, $line, -1;
@@ -233,10 +237,9 @@ for my $line (@state_line) {
     $field[6] += 1_000_000;
     $line = join "\t", @field;
 }
-write_state_file($decreasing_state_file, join "\n", @state_line);
+write_state_file(state_file_in($decreasing_dir), join "\n", @state_line);
 $result = $cp->run(
-    qq{--state-file="$decreasing_state_file" --critical=0% }
-    . q{--min-xact-rate=0 --min-rollback-rate=0}
+    qq{--audit-file-dir="$decreasing_dir" --critical='ratio=0:minxact=0:minrb=0'}
 );
 like(
     $result,
@@ -249,33 +252,31 @@ unlike(
     q{Action 'rollback_activity' does not evaluate negative counter deltas}
 );
 
-my $corrupt_state_file = catfile($state_dir, 'corrupt.state');
-open my $corrupt_fh, '>', $corrupt_state_file
-    or die qq{Could not create corrupt state fixture: $!\n};
-print {$corrupt_fh} "not a rollback_activity state file\n";
-close $corrupt_fh or die qq{Could not close corrupt state fixture: $!\n};
-$result = $cp->run(qq{--state-file="$corrupt_state_file"});
+my $corrupt_dir = fresh_state_dir();
+$cp->run(qq{--audit-file-dir="$corrupt_dir"});
+write_state_file(state_file_in($corrupt_dir), "not a rollback_activity state file\n");
+$result = $cp->run(qq{--audit-file-dir="$corrupt_dir"});
 like(
     $result,
     qr{^ERROR:.*state file}i,
     q{Action 'rollback_activity' reports corrupt state as UNKNOWN}
 );
 
-my $truncated_state_file = catfile($state_dir, 'truncated.state');
-$cp->run(qq{--state-file="$truncated_state_file"});
-my $truncated_state = read_state_file($truncated_state_file);
+my $truncated_dir = fresh_state_dir();
+$cp->run(qq{--audit-file-dir="$truncated_dir"});
+my $truncated_state = read_state_file(state_file_in($truncated_dir));
 $truncated_state =~ s/end\t\d+\n\z//;
-write_state_file($truncated_state_file, $truncated_state);
-$result = $cp->run(qq{--state-file="$truncated_state_file"});
+write_state_file(state_file_in($truncated_dir), $truncated_state);
+$result = $cp->run(qq{--audit-file-dir="$truncated_dir"});
 like(
     $result,
     qr{^ERROR:.*state file}i,
     q{Action 'rollback_activity' rejects line-aligned truncated state}
 );
 
-my $preserved_state = read_state_file($state_file);
+my $preserved_state = read_state_file(state_file_in($state_dir));
 $result = $cp->run(
-    qq{--state-file="$state_file" --dbhost="/no/such/postgresql/socket"}
+    qq{--audit-file-dir="$state_dir" --dbhost="/no/such/postgresql/socket"}
 );
 like(
     $result,
@@ -283,16 +284,17 @@ like(
     q{Action 'rollback_activity' reports a PostgreSQL query failure}
 );
 is(
-    read_state_file($state_file),
+    read_state_file(state_file_in($state_dir)),
     $preserved_state,
     q{Action 'rollback_activity' preserves the last good state after a query failure}
 );
 
-open my $lock_fh, '>>', "$state_file.lock"
+my $main_state_file = state_file_in($state_dir);
+open my $lock_fh, '>>', "$main_state_file.lock"
     or die qq{Could not create state lock fixture: $!\n};
 flock $lock_fh, LOCK_EX | LOCK_NB
     or die qq{Could not lock state fixture: $!\n};
-$result = $cp->run(qq{--state-file="$state_file"});
+$result = $cp->run(qq{--audit-file-dir="$state_dir"});
 like(
     $result,
     qr{^ERROR:.*already running}i,
@@ -300,46 +302,48 @@ like(
 );
 close $lock_fh or die qq{Could not close state lock fixture: $!\n};
 
-$result = $cp->run(q{--state-file="/no/such/directory/state"});
+$result = $cp->run(q{--audit-file-dir="/no/such/parent/directory"});
 like(
     $result,
     qr{^ERROR:.*state directory}i,
-    q{Action 'rollback_activity' reports an unusable state directory as UNKNOWN}
+    q{Action 'rollback_activity' reports an uncreatable state directory as UNKNOWN}
 );
 
-$result = $cp->run(qq{--state-file="$state_file" --min-xact-rate=-1});
+my $unsafe_dir = fresh_state_dir();
+chmod 0777, $unsafe_dir or die qq{Could not relax fixture permissions: $!\n};
+$result = $cp->run(qq{--audit-file-dir="$unsafe_dir"});
 like(
     $result,
-    qr{^ERROR:.*min-xact-rate cannot be negative}i,
-    q{Action 'rollback_activity' rejects negative transaction rate gates}
+    qr{^ERROR:.*Refusing to use state directory}i,
+    q{Action 'rollback_activity' refuses a world-writable state directory}
 );
 
-$result = $cp->run(qq{--state-file="$state_file" --warning=60% --critical=50%});
+$result = $cp->run(qq{--audit-file-dir="$state_dir" --critical='ratio=2:bogus=1'});
+like(
+    $result,
+    qr{^ERROR:.*Unknown rollback_activity critical key}i,
+    q{Action 'rollback_activity' rejects unknown threshold keys}
+);
+
+$result = $cp->run(qq{--audit-file-dir="$state_dir" --warning=60% --critical=50%});
 like(
     $result,
     qr{^ERROR:.*warning percentage cannot exceed critical percentage}i,
     q{Action 'rollback_activity' rejects inverted percentage thresholds}
 );
 
-$result = $cp->run(qq{--state-file="$state_file" --critical=101%});
+$result = $cp->run(qq{--audit-file-dir="$state_dir" --critical=101%});
 like(
     $result,
     qr{^ERROR:.*percentages cannot exceed 100%}i,
     q{Action 'rollback_activity' rejects percentages above 100}
 );
 
-$result = $cp->run('');
+$result = $cp->run(qq{--audit-file-dir="$state_dir" --critical='ratio=2:minxact=0:minrb=0'});
 like(
     $result,
-    qr{^ERROR:.*requires --state-file}i,
-    q{Action 'rollback_activity' requires a local state file}
-);
-
-$result = $cp->run(q{--state-file=relative.state});
-like(
-    $result,
-    qr{^ERROR:.*state-file must be an absolute path}i,
-    q{Action 'rollback_activity' rejects ambiguous relative state paths}
+    qr{^POSTGRES_ROLLBACK_ACTIVITY},
+    q{Action 'rollback_activity' accepts gates packed into the threshold}
 );
 
 done_testing();

@@ -10,22 +10,25 @@ HOSTED-POWER fork
 
 This fork also installs `check_postgresql`, while retaining the upstream
 `check_postgres.pl` executable for compatibility. Its `rollback_activity` action checks
-recent transaction-counter deltas with ratio and volume gates, stores its baseline in a
-local state file, and emits standard Nagios performance data without requiring Graphite.
-The initial fork revision reports itself as `2.26.0-hp1`. The conservative fleet policy
-below treats the action as a rollback-storm safety signal:
+recent transaction-counter deltas with ratio and volume gates, and emits standard Nagios
+performance data without requiring Graphite. The initial fork revision reports itself as
+`2.26.0-hp1`. The conservative fleet policy below treats the action as a rollback-storm
+safety signal:
 
-    check_postgresql --action=rollback_activity \
-      --warning=50% --critical=75% \
-      --min-xact-rate=1 --min-rollback-rate=1 \
-      --state-file=/var/lib/icinga2/check_postgresql/rollback_activity.state
+    check_postgresql --action=rollback_activity --warning=50% --critical=75%
 
-The first execution records the baseline and returns OK. Create the state directory in
-advance, make it writable by the monitoring user, and use a unique absolute state-file
-path for each separately scheduled service check. See `check_postgresql --man` for full
-details. PostgreSQL's transaction counters do not identify why a transaction rolled
-back, so this action detects major recent rollback activity rather than individual
-PostgreSQL or application errors.
+The volume gates default to one transaction and 0.1 rollbacks per second and can be
+carried in the threshold itself, in the style the `locks` action uses:
+
+    --critical='ratio=75:minxact=1:minrb=0.1'
+
+The baseline is stored in a file named after the connection string, in the directory
+given by `--audit-file-dir`, else `--tempdir`, else `/var/lib/check_postgres`. That
+directory is created if missing and refused if it is writable by group or other, since
+the file name is predictable. The first execution records the baseline and returns OK.
+See `check_postgresql --man` for full details. PostgreSQL's transaction counters do not
+identify why a transaction rolled back, so this action detects major recent rollback
+activity rather than individual PostgreSQL or application errors.
 
 The most complete and up to date information about this script can be found at:
 

@@ -23,7 +23,7 @@ carried in the threshold itself, in the style the `locks` action uses:
     --critical='ratio=75:minxact=1:minrb=0.1'
 
 The baseline is stored in a file named after the connection string, in the directory
-given by `--audit-file-dir`, else `--tempdir`, else `/var/lib/check_postgres`. That
+given by `--audit-file-dir`, else `--tempdir`, else `/var/lib/nagios/check_postgres`. That
 directory is created if missing and refused if it is writable by group or other, since
 the file name is predictable. The first execution records the baseline and returns OK.
 See `check_postgresql --man` for full details. PostgreSQL's transaction counters do not

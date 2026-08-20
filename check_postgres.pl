@@ -39,7 +39,7 @@ our $VERSION = '2.26.0';
 
 ## rollback_activity: where the baseline lives when neither --audit-file-dir
 ## nor --tempdir is given, and the volume gates applied when none are named.
-our $DEFAULT_STATE_DIR = '/var/lib/check_postgres';
+our $DEFAULT_STATE_DIR = '/var/lib/nagios/check_postgres';
 our $DEFAULT_MIN_XACT_RATE = 1;
 our $DEFAULT_MIN_ROLLBACK_RATE = 0.1;
 our %ROLLBACK_ACTIVITY_KEYS = (
@@ -11329,7 +11329,7 @@ rolled back, so this action detects major recent rollback activity rather than
 individual PostgreSQL or application errors.
 
 The baseline is stored in a file named after the connection string, in the directory
-given by I<--audit-file-dir>, else I<--tempdir>, else F</var/lib/check_postgres>. The
+given by I<--audit-file-dir>, else I<--tempdir>, else F</var/lib/nagios/check_postgres>. The
 directory is created if missing, and is refused if it is writable by group or other, or
 owned by anyone but root or the current user: the file name is predictable, so a shared
 directory such as F</tmp> would let a local user pre-create or poison the baseline.

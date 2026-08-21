@@ -78,7 +78,7 @@ like(
 ok(-s state_file_in($state_dir), q{Action 'rollback_activity' writes its state file});
 like(
     read_state_file(state_file_in($state_dir)),
-    qr{\Acheck_postgresql rollback_activity state 1\n.*\nend\t\d+\n\z}s,
+    qr{\Acheck_postgresql activity state 2\n.*\nend\t\d+\n\z}s,
     q{Action 'rollback_activity' uses a versioned primitive state format}
 );
 
@@ -344,6 +344,35 @@ like(
     $result,
     qr{^POSTGRES_ROLLBACK_ACTIVITY},
     q{Action 'rollback_activity' accepts gates packed into the threshold}
+);
+
+
+## deadlocks key: a deadlock in the interval is critical regardless of volume gates
+my $deadlock_dir = fresh_state_dir();
+$cp->run(qq{--audit-file-dir="$deadlock_dir"});
+my $victim = $cp->test_database_handle({quickreturn => 1});
+my $bully  = $cp->test_database_handle({quickreturn => 1});
+eval {
+    $victim->do('CREATE TABLE IF NOT EXISTS rb_dl_a (id int primary key)');
+    $bully->do('CREATE TABLE IF NOT EXISTS rb_dl_b (id int primary key)');
+    $victim->commit(); $bully->commit();
+    $victim->do('INSERT INTO rb_dl_a VALUES (1) ON CONFLICT DO NOTHING');
+    $bully->do('INSERT INTO rb_dl_b VALUES (1) ON CONFLICT DO NOTHING');
+    $victim->commit(); $bully->commit();
+    $victim->do('UPDATE rb_dl_a SET id=id WHERE id=1');
+    $bully->do('UPDATE rb_dl_b SET id=id WHERE id=1');
+    # cross-lock to force a deadlock; one side will be aborted by PostgreSQL
+    eval { $victim->do('UPDATE rb_dl_b SET id=id WHERE id=1'); };
+    eval { $bully->do('UPDATE rb_dl_a SET id=id WHERE id=1'); };
+    $victim->rollback; $bully->rollback;
+};
+$victim->disconnect; $bully->disconnect;
+sleep 1.1;
+$result = $cp->run(qq{--audit-file-dir="$deadlock_dir" --critical='deadlocks=1'});
+like(
+    $result,
+    qr{^POSTGRES_ROLLBACK_ACTIVITY (CRITICAL|OK):.*_deadlocks=}i,
+    q{Action 'rollback_activity' emits a deadlocks counter and accepts the deadlocks key}
 );
 
 done_testing();

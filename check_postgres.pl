@@ -43,11 +43,12 @@ our $DEFAULT_STATE_DIR = '/var/lib/nagios/check_postgres';
 our $DEFAULT_MIN_XACT_RATE = 1;
 our $DEFAULT_MIN_ROLLBACK_RATE = 0.1;
 our %ROLLBACK_ACTIVITY_KEYS = (
-    ratio    => 'ratio',
-    minxact  => 'minxact',
-    minrb    => 'minrb',
+    ratio     => 'ratio',
+    minxact   => 'minxact',
+    minrb     => 'minrb',
+    deadlocks => 'deadlocks',
 );
-our $DISPLAY_VERSION = "$VERSION-hp2";
+our $DISPLAY_VERSION = "$VERSION-hp3";
 our $COMMA = ',';
 
 use vars qw/ %opt $PGBINDIR $PSQL $res $COM $SQL $db /;
@@ -1941,7 +1942,8 @@ our $action_info = {
  query_time          => [1, 'Checks the maximum running time of current queries.'],
  replicate_row       => [0, 'Verify a simple update gets replicated to another server.'],
  replication_slots   => [1, 'Check the replication delay for replication slots'],
- rollback_activity   => [0, 'Check recent rollback activity since the previous execution.'],
+ rollback_activity   => [0, 'Check recent rollback ratio (and optionally deadlocks) since the previous execution.'],
+ temp_activity       => [0, 'Check the recent temp-file spill rate since the previous execution.'],
  same_schema         => [0, 'Verify that two databases have the exact same tables, columns, etc.'],
  sequence            => [0, 'Checks remaining calls left in sequences.'],
  settings_checksum   => [0, 'Check that no settings have changed since the last check.'],
@@ -2693,6 +2695,7 @@ check_commitratio() if $action eq 'commitratio';
 
 ## Check recent rollback activity since the previous execution
 check_rollback_activity() if $action eq 'rollback_activity';
+check_temp_activity() if $action eq 'temp_activity';
 
 ## Check the hitratio of one or more databases
 check_hitratio() if $action eq 'hitratio';
@@ -4907,12 +4910,13 @@ $USERWHERECLAUSE
 sub parse_rollback_activity_range {
 
     ## Accept a plain rollback percentage, or a key=value list carrying the
-    ## volume gates alongside it. Returns (ratio, min_xact_rate, min_rollback_rate),
-    ## any of which may be undef. Kept local rather than extending the shared
-    ## 'multival' type, which only parses integers and is used by check_locks.
+    ## volume gates and the optional deadlock trigger alongside it. Returns
+    ## (ratio, min_xact_rate, min_rollback_rate, deadlocks), any of which may be
+    ## undef. Kept local rather than extending the shared 'multival' type, which
+    ## only parses integers and is used by check_locks.
 
     my ($raw, $which) = @_;
-    return ('', undef, undef) if !defined $raw or !length $raw;
+    return ('', undef, undef, undef) if !defined $raw or !length $raw;
 
     my $num = qr{\d+(?:\.\d+)?};
 
@@ -4920,10 +4924,10 @@ sub parse_rollback_activity_range {
     if ($raw =~ /\A\s*($num)\s*%?\s*\z/) {
         my $ratio = $1;
         $ratio <= 100 or ndie qq{rollback_activity $which percentage cannot exceed 100%};
-        return ($ratio, undef, undef);
+        return ($ratio, undef, undef, undef);
     }
 
-    ## Keyed form: ratio=75:minxact=1:minrb=0.1
+    ## Keyed form: ratio=75:minxact=1:minrb=0.1:deadlocks=1
     my %val;
     for my $pair (split /[:,]/ => $raw) {
         next if $pair !~ /\S/;
@@ -4940,18 +4944,32 @@ sub parse_rollback_activity_range {
         $val{ratio} <= 100 or ndie qq{rollback_activity $which percentage cannot exceed 100%};
     }
 
-    return (defined $val{ratio} ? $val{ratio} : '', $val{minxact}, $val{minrb});
+    return (defined $val{ratio} ? $val{ratio} : '',
+            $val{minxact}, $val{minrb}, $val{deadlocks});
 
 } ## end of parse_rollback_activity_range
 
 
-sub rollback_activity_state_dir {
+sub parse_temp_activity_range {
 
-    ## Where to keep the rollback_activity baseline.
-    ## Follows the same precedence the audit file uses, and refuses a directory
-    ## that anyone else could write into: the file name is derived from the
-    ## connection string and is therefore predictable, so a shared directory
-    ## such as /tmp would let a local user pre-create or poison the baseline.
+    ## temp_activity thresholds are a spill rate in megabytes per second.
+
+    my ($raw, $which) = @_;
+    return '' if !defined $raw or !length $raw;
+    $raw =~ /\A\s*(\d+(?:\.\d+)?)\s*\z/
+        or ndie qq{temp_activity $which threshold must be a number in MB/s};
+    return $1;
+
+} ## end of parse_temp_activity_range
+
+
+sub activity_state_dir {
+
+    ## Where to keep an activity baseline. Follows the same precedence the audit
+    ## file uses, and refuses a directory that anyone else could write into: the
+    ## file name is derived from the connection string and is therefore
+    ## predictable, so a shared directory such as /tmp would let a local user
+    ## pre-create or poison the baseline.
 
     my $dir = $opt{'audit-file-dir'} // $opt{tempdir} // $DEFAULT_STATE_DIR;
 
@@ -4971,49 +4989,61 @@ sub rollback_activity_state_dir {
 
     return $dir;
 
-} ## end of rollback_activity_state_dir
+} ## end of activity_state_dir
 
 
-sub invalid_rollback_activity_state {
+sub invalid_activity_state {
 
     my $state_file = shift;
-    ndie qq{Invalid rollback_activity state file "$state_file"};
+    ndie qq{Invalid activity state file "$state_file"};
 
-} ## end of invalid_rollback_activity_state
+} ## end of invalid_activity_state
 
 
-sub rollback_activity_state_decode {
+sub activity_state_decode {
 
     my ($encoded, $state_file) = @_;
     $encoded =~ /\A(?:[0-9a-f]{2})+\z/
-        or invalid_rollback_activity_state($state_file);
+        or invalid_activity_state($state_file);
     my $decoded = pack 'H*', $encoded;
     utf8::decode($decoded)
-        or invalid_rollback_activity_state($state_file);
+        or invalid_activity_state($state_file);
     return $decoded;
 
-} ## end of rollback_activity_state_decode
+} ## end of activity_state_decode
 
 
-sub rollback_activity_state_encode {
+sub activity_state_encode {
 
     my $value = shift;
     utf8::encode($value);
     return unpack 'H*', $value;
 
-} ## end of rollback_activity_state_encode
+} ## end of activity_state_encode
 
 
-sub read_rollback_activity_state {
+sub read_activity_state {
+
+    ## Format 2 stores the fixed per-database prefix followed by a bag of named
+    ## counters, so a new counter never needs another format bump. A file left
+    ## by an older version is treated as no prior baseline (the next run simply
+    ## re-baselines and reports OK); only genuinely malformed content is an error.
 
     my $state_file = shift;
-    my $state = {format => 1, targets => {}};
+    my $state = {targets => {}};
     open my $state_fh, '<', $state_file
-        or ndie qq{Could not read rollback_activity state file "$state_file": $!};
+        or ndie qq{Could not read activity state file "$state_file": $!};
 
     my $header = <$state_fh>;
-    defined $header and $header eq "check_postgresql rollback_activity state 1\n"
-        or invalid_rollback_activity_state($state_file);
+    defined $header
+        or invalid_activity_state($state_file);
+    if ($header ne "check_postgresql activity state 2\n") {
+        if ($header =~ /\Acheck_postgresql \S.* state \d+\n\z/) {
+            close $state_fh;
+            return $state;   ## known older format: self-heal by re-baselining
+        }
+        invalid_activity_state($state_file);
+    }
 
     my $record_count = 0;
     my $footer_count;
@@ -5021,74 +5051,83 @@ sub read_rollback_activity_state {
         chomp $line;
         if ($line =~ /\Aend\t(\d+)\z/) {
             !defined $footer_count
-                or invalid_rollback_activity_state($state_file);
+                or invalid_activity_state($state_file);
             $footer_count = 0 + $1;
             next;
         }
         !defined $footer_count
-            or invalid_rollback_activity_state($state_file);
+            or invalid_activity_state($state_file);
         my @field = split /\t/, $line, -1;
-        @field == 8
-            or invalid_rollback_activity_state($state_file);
-        $field[0] eq '1'
-            or invalid_rollback_activity_state($state_file);
-        for my $number (@field[3, 7]) {
-            $number =~ /\A\d+(?:\.\d+)?\z/
-                or invalid_rollback_activity_state($state_file);
-        }
-        for my $integer (@field[4..6]) {
-            $integer =~ /\A\d+\z/
-                or invalid_rollback_activity_state($state_file);
-        }
+        @field >= 6
+            or invalid_activity_state($state_file);
+        $field[0] eq '2'
+            or invalid_activity_state($state_file);
+        $field[3] =~ /\A\d+(?:\.\d+)?\z/
+            or invalid_activity_state($state_file);
+        $field[4] =~ /\A\d+\z/
+            or invalid_activity_state($state_file);
+        $field[5] =~ /\A\d+(?:\.\d+)?\z/
+            or invalid_activity_state($state_file);
 
-        my $target = rollback_activity_state_decode($field[1], $state_file);
-        my $dbname = rollback_activity_state_decode($field[2], $state_file);
+        my $target = activity_state_decode($field[1], $state_file);
+        my $dbname = activity_state_decode($field[2], $state_file);
         !exists $state->{targets}{$target}{$dbname}
-            or invalid_rollback_activity_state($state_file);
-        $state->{targets}{$target}{$dbname} = {
+            or invalid_activity_state($state_file);
+        my %record = (
             sample_time  => 0 + $field[3],
             database_oid => 0 + $field[4],
-            commit       => 0 + $field[5],
-            rollback     => 0 + $field[6],
-            stats_reset  => 0 + $field[7],
-        };
+            stats_reset  => 0 + $field[5],
+        );
+        for my $kv (@field[6 .. $#field]) {
+            $kv =~ /\A(\w+)=(\d+(?:\.\d+)?)\z/
+                or invalid_activity_state($state_file);
+            $record{$1} = 0 + $2;
+        }
+        $state->{targets}{$target}{$dbname} = \%record;
         $record_count++;
     }
     defined $footer_count and $footer_count == $record_count
-        or invalid_rollback_activity_state($state_file);
+        or invalid_activity_state($state_file);
     close $state_fh
-        or ndie qq{Could not close rollback_activity state file "$state_file": $!};
+        or ndie qq{Could not close activity state file "$state_file": $!};
 
     return $state;
 
-} ## end of read_rollback_activity_state
+} ## end of read_activity_state
 
 
-sub write_rollback_activity_state {
+sub write_activity_state {
 
     my ($state, $state_dir, $state_file) = @_;
     my ($state_fh, $temp_state_file);
 
     eval {
         ($state_fh, $temp_state_file) = tempfile(
-            '.check_postgresql_rollback_activity.XXXXXX',
+            '.check_postgresql_activity.XXXXXX',
             DIR => $state_dir,
             UNLINK => 0,
         );
-        print {$state_fh} "check_postgresql rollback_activity state 1\n"
+        chmod 0600, $temp_state_file;
+        print {$state_fh} "check_postgresql activity state 2\n"
             or die qq{Could not write "$temp_state_file": $!\n};
         my $record_count = 0;
         for my $target (sort keys %{$state->{targets}}) {
             for my $dbname (sort keys %{$state->{targets}{$target}}) {
                 my $data = $state->{targets}{$target}{$dbname};
-                printf {$state_fh} "1\t%s\t%s\t%.6f\t%d\t%d\t%d\t%.6f\n",
-                    rollback_activity_state_encode($target),
-                    rollback_activity_state_encode($dbname),
+                my @counter;
+                for my $key (sort keys %$data) {
+                    next if $key eq 'sample_time'
+                         or $key eq 'database_oid'
+                         or $key eq 'stats_reset';
+                    push @counter, "$key=$data->{$key}";
+                }
+                printf {$state_fh} "2\t%s\t%s\t%.6f\t%d\t%.6f\t%s\n",
+                    activity_state_encode($target),
+                    activity_state_encode($dbname),
                     $data->{sample_time},
                     $data->{database_oid},
-                    $data->{commit},
-                    $data->{rollback},
-                    $data->{stats_reset}
+                    $data->{stats_reset},
+                    join "\t", @counter
                     or die qq{Could not write "$temp_state_file": $!\n};
                 $record_count++;
             }
@@ -5104,65 +5143,44 @@ sub write_rollback_activity_state {
         my $error = $@;
         close $state_fh if defined $state_fh and defined fileno $state_fh;
         unlink $temp_state_file if defined $temp_state_file and -e $temp_state_file;
-        ndie qq{Could not write rollback_activity state file "$state_file": $error};
+        ndie qq{Could not write activity state file "$state_file": $error};
     }
 
     return;
 
-} ## end of write_rollback_activity_state
+} ## end of write_activity_state
 
 
-sub check_rollback_activity {
+sub run_activity {
 
-    ## Check recent transaction activity using a persistent counter baseline
+    ## Shared plumbing for the counter-delta actions. Opens and locks the
+    ## per-connection baseline, samples pg_stat_database, and for each database
+    ## with a comparable previous sample calls the evaluator with the elapsed
+    ## time and the old and current counter hashes. The evaluator appends its
+    ## own performance data and returns a message and a severity.
 
-    ## Thresholds are a rollback percentage, optionally carrying the volume
-    ## gates in the same argument the way check_locks does, for example:
-    ##   --critical='75%'
-    ##   --critical='ratio=75:minxact=1:minrb=0.1'
-    my ($warning, $min_xact_rate, $min_rollback_rate)
-        = parse_rollback_activity_range($opt{warning}, 'warning');
-    my ($critical, $c_xact, $c_rollback)
-        = parse_rollback_activity_range($opt{critical}, 'critical');
-    ## Gates are filters rather than severities: critical wins when both name one
-    $min_xact_rate = $c_xact if defined $c_xact;
-    $min_rollback_rate = $c_rollback if defined $c_rollback;
-    $min_xact_rate //= $DEFAULT_MIN_XACT_RATE;
-    $min_rollback_rate //= $DEFAULT_MIN_ROLLBACK_RATE;
+    my %arg = @_;
+    my $label    = $arg{label};
+    my $columns  = $arg{columns};
+    my $evaluate = $arg{evaluate};
 
-    if (length $warning and length $critical and $warning > $critical) {
-        ndie q{rollback_activity warning percentage cannot exceed critical percentage};
-    }
-
-    my $state_dir = rollback_activity_state_dir();
-    my $state_file = catfile($state_dir, audit_filename('rollback_activity'));
+    my $state_dir  = activity_state_dir();
+    my $state_file = catfile($state_dir, audit_filename($label));
 
     open my $lock_fh, '>>', "$state_file.lock"
-        or ndie qq{Could not open rollback_activity state lock "$state_file.lock": $!};
+        or ndie qq{Could not open $label state lock "$state_file.lock": $!};
+    chmod 0600, "$state_file.lock";
     flock $lock_fh, LOCK_EX | LOCK_NB
-        or ndie qq{rollback_activity is already running with state file "$state_file"};
+        or ndie qq{$label is already running with state file "$state_file"};
 
-    my $previous = {format => 1, targets => {}};
+    my $previous = {targets => {}};
     if (-e $state_file) {
-        $previous = read_rollback_activity_state($state_file);
+        $previous = read_activity_state($state_file);
     }
 
-    $SQL = q{
-SELECT
-  extract(epoch FROM clock_timestamp()) AS sample_time,
-  d.datname,
-  d.oid AS database_oid,
-  sd.xact_commit,
-  sd.xact_rollback,
-  COALESCE(extract(epoch FROM sd.stats_reset), 0) AS stats_reset
-FROM pg_stat_database sd
-JOIN pg_database d ON (d.oid=sd.datid)
-WHERE d.datallowconn
-ORDER BY d.datname
-};
-
+    $SQL = $arg{sql};
     my $info = run_command($SQL, { regex => qr{\d+}, emptyok => 1 });
-    my $state = {format => 1, targets => {}};
+    my $state = {targets => {}};
     my $evaluated = 0;
     my $matched = 0;
     my $multiple_targets = @{$info->{db}} > 1;
@@ -5174,9 +5192,7 @@ ORDER BY d.datname
         my $target = $db->{pname};
         my $previous_target = $previous->{targets}{$target} || {};
         my $current_target = $state->{targets}{$target} = {};
-        my @critical_msg;
-        my @warning_msg;
-        my @ok_msg;
+        my (@critical_msg, @warning_msg, @ok_msg);
 
         for my $row (@{$db->{slurp}}) {
             next if skip_item($row->{datname});
@@ -5185,10 +5201,9 @@ ORDER BY d.datname
             my $current = $current_target->{$dbname} = {
                 sample_time  => 0 + $row->{sample_time},
                 database_oid => 0 + $row->{database_oid},
-                commit       => 0 + $row->{xact_commit},
-                rollback     => 0 + $row->{xact_rollback},
                 stats_reset  => 0 + $row->{stats_reset},
             };
+            $current->{$_} = 0 + $row->{$_} for @$columns;
 
             my $old = $previous_target->{$dbname};
             next if ref $old ne 'HASH';
@@ -5196,39 +5211,21 @@ ORDER BY d.datname
             next if $current->{stats_reset} != $old->{stats_reset};
 
             my $elapsed = $current->{sample_time} - $old->{sample_time};
-            my $commits = $current->{commit} - $old->{commit};
-            my $rollbacks = $current->{rollback} - $old->{rollback};
-            next if $elapsed <= 0 or $commits < 0 or $rollbacks < 0;
-
-            my $transactions = $commits + $rollbacks;
-            my $commit_rate = $commits / $elapsed;
-            my $rollback_rate = $rollbacks / $elapsed;
-            my $xact_rate = $transactions / $elapsed;
-            my $rollback_ratio = $transactions ? 100 * $rollbacks / $transactions : 0;
+            next if $elapsed <= 0;
+            my $negative = 0;
+            for my $key (@$columns) {
+                $negative = 1 if !defined $old->{$key} or $current->{$key} < $old->{$key};
+            }
+            next if $negative;
             $evaluated++;
 
-            my $perf_prefix = $multiple_targets ? "target${target_number}_${dbname}" : $dbname;
-            $db->{perf} .= sprintf ' %s=%.2f %s=%.2f %s=%.2f %s=%.2f%%;%s;%s;0;100',
-                perfname("${perf_prefix}_commit_rate"), $commit_rate,
-                perfname("${perf_prefix}_rollback_rate"), $rollback_rate,
-                perfname("${perf_prefix}_xact_rate"), $xact_rate,
-                perfname("${perf_prefix}_rollback_ratio"), $rollback_ratio,
-                $warning, $critical;
+            my $prefix = $multiple_targets ? "target${target_number}_${dbname}" : $dbname;
+            my ($msg, $severity) =
+                $evaluate->($dbname, $elapsed, $old, $current, $prefix, \$db->{perf});
 
-            my $msg = sprintf '%s rollback %.2f%% (%.2f/s of %.2f tx/s)',
-                $dbname, $rollback_ratio, $rollback_rate, $xact_rate;
-            my $volume_is_significant = ($xact_rate >= $min_xact_rate
-                and $rollback_rate >= $min_rollback_rate);
-
-            if ($volume_is_significant and length $critical and $rollback_ratio > $critical) {
-                push @critical_msg => $msg;
-            }
-            elsif ($volume_is_significant and length $warning and $rollback_ratio > $warning) {
-                push @warning_msg => $msg;
-            }
-            else {
-                push @ok_msg => $msg;
-            }
+            if    ($severity eq 'critical') { push @critical_msg => $msg }
+            elsif ($severity eq 'warning')  { push @warning_msg  => $msg }
+            else                            { push @ok_msg       => $msg }
         }
 
         if (@critical_msg) {
@@ -5242,14 +5239,152 @@ ORDER BY d.datname
         }
     }
 
-    $matched or ndie q{No matching databases found for rollback_activity};
+    $matched or ndie qq{No matching databases found for $label};
 
-    write_rollback_activity_state($state, $state_dir, $state_file);
+    write_activity_state($state, $state_dir, $state_file);
 
     add_ok q{initial baseline recorded} if !$evaluated;
     return;
 
+} ## end of run_activity
+
+
+sub check_rollback_activity {
+
+    ## Recent rollback share, with optional volume gates and an optional
+    ## deadlock trigger, all carried in --warning/--critical:
+    ##   --critical='75%'
+    ##   --critical='ratio=75:minxact=1:minrb=0.1:deadlocks=1'
+    my ($warning, $min_xact_rate, $min_rollback_rate, $w_deadlocks)
+        = parse_rollback_activity_range($opt{warning}, 'warning');
+    my ($critical, $c_xact, $c_rollback, $c_deadlocks)
+        = parse_rollback_activity_range($opt{critical}, 'critical');
+    $min_xact_rate = $c_xact if defined $c_xact;
+    $min_rollback_rate = $c_rollback if defined $c_rollback;
+    $min_xact_rate //= $DEFAULT_MIN_XACT_RATE;
+    $min_rollback_rate //= $DEFAULT_MIN_ROLLBACK_RATE;
+    ## A deadlock is a genuine error regardless of severity, so critical wins
+    my $deadlock_trigger = $c_deadlocks // $w_deadlocks;
+
+    if (length $warning and length $critical and $warning > $critical) {
+        ndie q{rollback_activity warning percentage cannot exceed critical percentage};
+    }
+
+    run_activity(
+        label   => 'rollback_activity',
+        columns => [qw/commit rollback deadlocks/],
+        sql     => q{
+SELECT
+  extract(epoch FROM clock_timestamp()) AS sample_time,
+  d.datname,
+  d.oid AS database_oid,
+  sd.xact_commit AS commit,
+  sd.xact_rollback AS rollback,
+  sd.deadlocks AS deadlocks,
+  COALESCE(extract(epoch FROM sd.stats_reset), 0) AS stats_reset
+FROM pg_stat_database sd
+JOIN pg_database d ON (d.oid=sd.datid)
+WHERE d.datallowconn
+ORDER BY d.datname
+},
+        evaluate => sub {
+            my ($dbname, $elapsed, $old, $current, $prefix, $perf_ref) = @_;
+
+            my $commits   = $current->{commit}   - $old->{commit};
+            my $rollbacks = $current->{rollback} - $old->{rollback};
+            my $deadlocks = $current->{deadlocks} - $old->{deadlocks};
+            my $transactions  = $commits + $rollbacks;
+            my $commit_rate   = $commits / $elapsed;
+            my $rollback_rate = $rollbacks / $elapsed;
+            my $xact_rate     = $transactions / $elapsed;
+            my $rollback_ratio = $transactions ? 100 * $rollbacks / $transactions : 0;
+
+            $$perf_ref .= sprintf ' %s=%.2f %s=%.2f %s=%.2f %s=%.2f%%;%s;%s;0;100 %s=%d;%s;%s',
+                perfname("${prefix}_commit_rate"), $commit_rate,
+                perfname("${prefix}_rollback_rate"), $rollback_rate,
+                perfname("${prefix}_xact_rate"), $xact_rate,
+                perfname("${prefix}_rollback_ratio"), $rollback_ratio, $warning, $critical,
+                perfname("${prefix}_deadlocks"), $deadlocks,
+                (defined $deadlock_trigger ? $deadlock_trigger : ''),
+                (defined $deadlock_trigger ? $deadlock_trigger : '');
+
+            my $volume_ok = ($xact_rate >= $min_xact_rate and $rollback_rate >= $min_rollback_rate);
+            my $msg = sprintf '%s rollback %.2f%% (%.2f/s of %.2f tx/s)',
+                $dbname, $rollback_ratio, $rollback_rate, $xact_rate;
+
+            if (defined $deadlock_trigger and $deadlock_trigger > 0 and $deadlocks >= $deadlock_trigger) {
+                return (sprintf('%s; %d deadlock(s)', $msg, $deadlocks), 'critical');
+            }
+            if ($volume_ok and length $critical and $rollback_ratio > $critical) {
+                return ($msg, 'critical');
+            }
+            if ($volume_ok and length $warning and $rollback_ratio > $warning) {
+                return ($msg, 'warning');
+            }
+            return ($msg, 'ok');
+        },
+    );
+
+    return;
+
 } ## end of check_rollback_activity
+
+
+sub check_temp_activity {
+
+    ## Recent temporary-file spill rate: sorts and hashes that overflowed
+    ## work_mem and were written to disk. Thresholds are megabytes per second.
+    my $warning  = parse_temp_activity_range($opt{warning}, 'warning');
+    my $critical = parse_temp_activity_range($opt{critical}, 'critical');
+    if (length $warning and length $critical and $warning > $critical) {
+        ndie q{temp_activity warning rate cannot exceed critical rate};
+    }
+
+    run_activity(
+        label   => 'temp_activity',
+        columns => [qw/temp_files temp_bytes/],
+        sql     => q{
+SELECT
+  extract(epoch FROM clock_timestamp()) AS sample_time,
+  d.datname,
+  d.oid AS database_oid,
+  sd.temp_files AS temp_files,
+  sd.temp_bytes AS temp_bytes,
+  COALESCE(extract(epoch FROM sd.stats_reset), 0) AS stats_reset
+FROM pg_stat_database sd
+JOIN pg_database d ON (d.oid=sd.datid)
+WHERE d.datallowconn
+ORDER BY d.datname
+},
+        evaluate => sub {
+            my ($dbname, $elapsed, $old, $current, $prefix, $perf_ref) = @_;
+
+            my $files = $current->{temp_files} - $old->{temp_files};
+            my $bytes = $current->{temp_bytes} - $old->{temp_bytes};
+            my $mb_per_s    = ($bytes / $elapsed) / 1048576;
+            my $files_per_s = $files / $elapsed;
+            my $mb_total    = $bytes / 1048576;
+
+            $$perf_ref .= sprintf ' %s=%.3f;%s;%s;0 %s=%.3f',
+                perfname("${prefix}_temp_mb_per_s"), $mb_per_s, $warning, $critical,
+                perfname("${prefix}_temp_files_per_s"), $files_per_s;
+
+            my $msg = sprintf '%s spilled %.1f MB/s (%.0f MB, %d files over %.0fs)',
+                $dbname, $mb_per_s, $mb_total, $files, $elapsed;
+
+            if (length $critical and $mb_per_s > $critical) {
+                return ($msg, 'critical');
+            }
+            if (length $warning and $mb_per_s > $warning) {
+                return ($msg, 'warning');
+            }
+            return ($msg, 'ok');
+        },
+    );
+
+    return;
+
+} ## end of check_temp_activity
 
 
 sub check_connection {
@@ -11314,9 +11449,13 @@ carry the volume gates in the same argument, in the style used by the B<locks> a
 
 =item * C<minrb> - recent rollbacks per second, below which the database is skipped
 
+=item * C<deadlocks> - alert critical when at least this many deadlocks occurred in the
+interval; a deadlock is always a genuine error, so this ignores the volume gates
+
 =back
 
-So C<--critical='75%'> and C<--critical='ratio=75:minxact=1:minrb=0.1'> are both valid.
+So C<--critical='75%'>, C<--critical='ratio=75:minxact=1:minrb=0.1'> and
+C<--critical='ratio=75:deadlocks=1'> are all valid.
 The gates default to one transaction and 0.1 rollbacks per second, so that a database
 with almost no traffic is not judged on a handful of samples. A skipped database
 reports OK. Gates named on I<--critical> take precedence over those on I<--warning>,
@@ -11351,6 +11490,30 @@ The same policy with the volume gates named explicitly:
 
   check_postgresql --action=rollback_activity \
     --warning=50% --critical='ratio=75:minxact=1:minrb=0.1'
+
+=head2 B<temp_activity>
+
+(C<symlink: check_postgresql_temp_activity>) Checks how fast a database is writing
+temporary files - sorts and hashes that overflowed C<work_mem> and spilled to disk -
+from the change in C<pg_stat_database> since the previous execution. High spill rates
+mean queries are doing disk I/O that could be done in memory, and usually point at
+C<work_mem> tuning or a query that needs an index.
+
+The I<--warning> and I<--critical> values are a spill rate in megabytes per second.
+Both are optional; with neither set the action only reports OK and emits performance
+data. It emits the spill rate in MB/s and the temp-file creation rate per second.
+
+The baseline is stored and secured exactly as for B<rollback_activity>: a file named
+after the connection string under I<--audit-file-dir>, else I<--tempdir>, else
+F</var/lib/nagios/check_postgres>, in a directory refused when writable by anyone else.
+The first execution records a baseline and returns OK. New databases, counter decreases,
+statistics resets, and non-positive intervals refresh the baseline without alerting.
+
+This action requires PostgreSQL 9.1 or newer.
+
+Example: warn at 5 MB/s of spill and go critical at 20 MB/s.
+
+  check_postgresql --action=temp_activity --warning=5 --critical=20
 
 =head2 B<same_schema>
 

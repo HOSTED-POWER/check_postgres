@@ -84,6 +84,7 @@
       <li><a href="#replicate_row">replicate_row</a></li>
       <li><a href="#replication_slots">replication_slots</a></li>
       <li><a href="#rollback_activity">rollback_activity</a></li>
+      <li><a href="#temp_activity">temp_activity</a></li>
       <li><a href="#same_schema">same_schema</a></li>
       <li><a href="#sequence1">sequence</a></li>
       <li><a href="#settings_checksum">settings_checksum</a></li>
@@ -289,24 +290,6 @@ Connects using the named service &#39;foo&#39; in the pg_service.conf file, but 
 <dd>
 
 <p>Sets the threshold at which a critical alert is fired. The valid options for this option depends on the action used.</p>
-
-</dd>
-<dt id="state-file-PATH"><b>--state-file=PATH</b></dt>
-<dd>
-
-<p>Sets the persistent counter baseline used by the <b>rollback_activity</b> action. Use a unique absolute path for each monitoring service. The containing directory must already exist and be writable by the monitoring user.</p>
-
-</dd>
-<dt id="min-xact-rate-NUM"><b>--min-xact-rate=NUM</b></dt>
-<dd>
-
-<p>Sets the minimum recent transaction rate, in transactions per second, required before the <b>rollback_activity</b> action may alert. The default is zero.</p>
-
-</dd>
-<dt id="min-rollback-rate-NUM"><b>--min-rollback-rate=NUM</b></dt>
-<dd>
-
-<p>Sets the minimum recent rollback rate, in rollbacks per second, required before the <b>rollback_activity</b> action may alert. The default is zero.</p>
 
 </dd>
 <dt id="t-VAL-or---timeout-VAL"><b>-t VAL</b> or <b>--timeout=VAL</b></dt>
@@ -1205,30 +1188,54 @@ check_postgres_prepared_txns --critical=360 --include=shrike</code></pre>
 
 <p>(<code>symlink: check_postgresql_rollback_activity</code>) Checks recent rollback activity from the change in <code>pg_stat_database</code> transaction counters since the previous execution. Unlike <b>commitratio</b>, this action does not evaluate the lifetime ratio accumulated since PostgreSQL statistics were last reset.</p>
 
-<p>The <i>--warning</i> and <i>--critical</i> values are optional percentages. A database alerts only when its recent rollback percentage is greater than the configured threshold <i>and</i> both of these volume gates are met:</p>
+<p>The <i>--warning</i> and <i>--critical</i> values are a rollback percentage. They may also carry the volume gates in the same argument, in the style used by the <b>locks</b> action:</p>
 
 <ul>
 
-<li><p><i>--min-xact-rate</i> - recent commits plus rollbacks per second</p>
+<li><p><code>ratio</code> - the rollback percentage above which the database alerts</p>
 
 </li>
-<li><p><i>--min-rollback-rate</i> - recent rollbacks per second</p>
+<li><p><code>minxact</code> - recent commits plus rollbacks per second, below which the database is skipped</p>
+
+</li>
+<li><p><code>minrb</code> - recent rollbacks per second, below which the database is skipped</p>
+
+</li>
+<li><p><code>deadlocks</code> - alert critical when at least this many deadlocks occurred in the interval; a deadlock is always a genuine error, so this ignores the volume gates</p>
 
 </li>
 </ul>
 
-<p>Both gates default to zero. Set them explicitly when low-volume rollback bursts should not alert. The action emits commit rate, rollback rate, total transaction rate, and rollback percentage as Nagios performance data; it does not require Graphite or any other time-series system. PostgreSQL&#39;s transaction counters do not identify why a transaction rolled back, so this action detects major recent rollback activity rather than individual PostgreSQL or application errors.</p>
+<p>So <code>--critical=&#39;75%&#39;</code>, <code>--critical=&#39;ratio=75:minxact=1:minrb=0.1&#39;</code> and <code>--critical=&#39;ratio=75:deadlocks=1&#39;</code> are all valid. The gates default to one transaction and 0.1 rollbacks per second, so that a database with almost no traffic is not judged on a handful of samples. A skipped database reports OK. Gates named on <i>--critical</i> take precedence over those on <i>--warning</i>, as they filter rather than set a severity.</p>
 
-<p>The <i>--state-file</i> option requires an absolute path. The first execution records a baseline and returns OK. Updates are locked and atomically replaced. New databases, counter decreases, PostgreSQL statistics resets, and non-positive sample intervals refresh the affected baseline without alerting. Use a different state file for every separately scheduled service check; one invocation may still check multiple connection targets. For a multi-target invocation, performance labels are prefixed with <code>target1_</code>, <code>target2_</code>, and so on to remain unique. Databases can be selected with <i>--include</i> and <i>--exclude</i>.</p>
+<p>The action emits commit rate, rollback rate, total transaction rate, and rollback percentage as Nagios performance data; it does not require Graphite or any other time-series system. PostgreSQL&#39;s transaction counters do not identify why a transaction rolled back, so this action detects major recent rollback activity rather than individual PostgreSQL or application errors.</p>
+
+<p>The baseline is stored in a file named after the connection string, in the directory given by <i>--audit-file-dir</i>, else <i>--tempdir</i>, else <i>/var/lib/nagios/check_postgres</i>. The directory is created if missing, and is refused if it is writable by group or other, or owned by anyone but root or the current user: the file name is predictable, so a shared directory such as <i>/tmp</i> would let a local user pre-create or poison the baseline. The first execution records a baseline and returns OK. Updates are locked and atomically replaced. New databases, counter decreases, PostgreSQL statistics resets, and non-positive sample intervals refresh the affected baseline without alerting. One invocation may check multiple connection targets. For a multi-target invocation, performance labels are prefixed with <code>target1_</code>, <code>target2_</code>, and so on to remain unique. Databases can be selected with <i>--include</i> and <i>--exclude</i>.</p>
 
 <p>This action requires PostgreSQL 9.1 or newer.</p>
 
-<p>Example conservative rollback-storm policy: warn when more than half of recent transactions roll back and become critical above 75%, but only when the database is processing at least one transaction and one rollback per second. These values are an explicit policy example, not built-in defaults:</p>
+<p>Example conservative rollback-storm policy: warn when more than half of recent transactions roll back, and go critical above 75%:</p>
+
+<pre><code>check_postgresql --action=rollback_activity --warning=50% --critical=75%</code></pre>
+
+<p>The same policy with the volume gates named explicitly:</p>
 
 <pre><code>check_postgresql --action=rollback_activity \
-  --warning=50% --critical=75% \
-  --min-xact-rate=1 --min-rollback-rate=1 \
-  --state-file=/var/lib/icinga2/check_postgresql/rollback_activity.state</code></pre>
+  --warning=50% --critical=&#39;ratio=75:minxact=1:minrb=0.1&#39;</code></pre>
+
+<h2 id="temp_activity"><b>temp_activity</b></h2>
+
+<p>(<code>symlink: check_postgresql_temp_activity</code>) Checks how fast a database is writing temporary files - sorts and hashes that overflowed <code>work_mem</code> and spilled to disk - from the change in <code>pg_stat_database</code> since the previous execution. High spill rates mean queries are doing disk I/O that could be done in memory, and usually point at <code>work_mem</code> tuning or a query that needs an index.</p>
+
+<p>The <i>--warning</i> and <i>--critical</i> values are a spill rate in megabytes per second. Both are optional; with neither set the action only reports OK and emits performance data. It emits the spill rate in MB/s and the temp-file creation rate per second.</p>
+
+<p>The baseline is stored and secured exactly as for <b>rollback_activity</b>: a file named after the connection string under <i>--audit-file-dir</i>, else <i>--tempdir</i>, else <i>/var/lib/nagios/check_postgres</i>, in a directory refused when writable by anyone else. The first execution records a baseline and returns OK. New databases, counter decreases, statistics resets, and non-positive intervals refresh the baseline without alerting.</p>
+
+<p>This action requires PostgreSQL 9.1 or newer.</p>
+
+<p>Example: warn at 5 MB/s of spill and go critical at 20 MB/s.</p>
+
+<pre><code>check_postgresql --action=temp_activity --warning=5 --critical=20</code></pre>
 
 <h2 id="same_schema"><b>same_schema</b></h2>
 
